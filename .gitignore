@@ -1,0 +1,3 @@
+
+*.pyc
+/pipeline_proposal/trained_models_on_colab
