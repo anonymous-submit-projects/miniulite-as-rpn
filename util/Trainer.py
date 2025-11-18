@@ -57,102 +57,105 @@ class EarlyStopping:
 # In[ ]:
 
 
-def compute_segmentation_metrics(preds, targets, num_classes, eps=1e-6):
-    preds = preds.view(-1).cpu()
-    targets = targets.view(-1).cpu()
-
-    dice_total          = 0.0
-    miou_total          = 0.0
-    iou_valid_classes   = 0
-    precision_per_class = []
-    recall_per_class    = []
-    f1_per_class        = []
-
-    # If it is binary, we only evaluate class 1
-    classes_to_eval = [1] if num_classes == 1 else range(num_classes)
-
-    for cls in classes_to_eval:
-        pred_mask = (preds == cls)
-        target_mask = (targets == cls)
-
-        intersection = (pred_mask & target_mask).sum().float()
-        pred_sum = pred_mask.sum().float()
-        target_sum = target_mask.sum().float()
-        union = pred_sum + target_sum
-
-        # Dice
-        if union > 0:
-            dice = (2.0 * intersection + eps) / (union + eps)
-            dice_total += dice.item()
-
-        # Io u
-        union_iou = (pred_mask | target_mask).sum().float()
-        if union_iou > 0:
-            iou = (intersection + eps) / (union_iou + eps)
-            miou_total += iou.item()
-            iou_valid_classes += 1
-
-        # Precision, Recall
-        tp = intersection.item()
-        fp = (pred_mask & ~target_mask).sum().float().item()
-        fn = (~pred_mask & target_mask).sum().float().item()
-
-        if (tp + fp + fn) > 0:
-            precision = tp / (tp + fp + eps)
-            recall = tp / (tp + fn + eps)
-            f1 = (2 * precision * recall) / (precision + recall + eps)
-
-            precision_per_class.append(precision)
-            recall_per_class.append(recall)
-            f1_per_class.append(f1)
-
-    mean_dice = dice_total / len(classes_to_eval)
-    mean_iou = miou_total / iou_valid_classes if iou_valid_classes > 0 else 0.0
-    mean_precision = np.mean(precision_per_class) if precision_per_class else 0.0
-    mean_recall = np.mean(recall_per_class) if recall_per_class else 0.0
-    mean_f1 = np.mean(f1_per_class) if f1_per_class else 0.0
-    q = mean_iou * mean_dice
-
-    return mean_dice, mean_iou, mean_precision, mean_recall, mean_f1, q
+import torch
+import numpy as np
+from torchmetrics.classification import (
+    MulticlassJaccardIndex,
+    MulticlassPrecision,
+    MulticlassRecall,
+    MulticlassF1Score,
+)
+# We are not using DiceScore for multiclass here
+# because they don't have ignore_index support yet.
+#from torchmetrics.segmentation import DiceScore, MeanIoU
 
 
-# It calculates image by image and then takes the average.
-def compute_iou(preds, masks, num_classes=1, eps=1e-6):
-    iou_per_class = [ [] for _ in range(num_classes) ]  # list of lists
+def evaluate_model(model, data_loader, num_classes=2, print_stats=False, criterion=None, device='cuda'):
 
-    batch_size = preds.size(0)
+    model.eval()
+    #dice_metric      = DiceScore(num_classes=num_classes, average="macro", input_format='index', aggregation_level='global').to(device)
+    #miou_metric      = MeanIoU(num_classes=num_classes, input_format='index').to(device)
+    miou_metric      = MulticlassJaccardIndex(num_classes=num_classes, average="macro", ignore_index=255).to(device)
+    prec_metric      = MulticlassPrecision(num_classes=num_classes, average="macro", ignore_index=255).to(device)
+    recall_metric    = MulticlassRecall(num_classes=num_classes, average="macro", ignore_index=255).to(device)
+    f1_metric        = MulticlassF1Score(num_classes=num_classes, average="macro", ignore_index=255).to(device)
 
-    for i in range(batch_size):
-        pred = preds[i]
-        mask = masks[i]
+    val_loss    = 0.0
+    mIoU        = 0.0
+    precision   = 0.0
+    recall      = 0.0
+    f1          = 0.0
+    q           = 0.0
 
-        for cls in range(num_classes):
-            pred_cls = (pred == cls).float()
-            mask_cls = (mask == cls).float()
+    dataset_size = len(data_loader.dataset)
 
-            if mask_cls.sum() == 0:
-                continue  # does not evaluate missing class in ground truth
+    with torch.no_grad():
+        for images, masks in data_loader:
+            images = images.to(device)
+            masks  = masks.to(device)
+            if num_classes > 2:
+                masks = masks.squeeze(1)
 
-            intersection = (pred_cls * mask_cls).sum()
-            union = ((pred_cls + mask_cls) > 0).float().sum()
-            iou = (intersection + eps) / (union + eps)
-            iou_per_class[cls].append(iou)
+            outputs = model(images)
 
-    # average per class
-    class_ious = [
-        torch.stack(iou_list).mean()
-        for iou_list in iou_per_class
-        if len(iou_list) > 0
-    ]
+            # Loss 
+            if criterion is not None:
+                loss = criterion(outputs, masks)
+                val_loss += loss.item() * images.size(0)
 
-    if not class_ious:
-        return 0.0
+            # sigmoid for binary, softmax for multi-class
+            if num_classes == 2:
+                preds = torch.sigmoid(outputs)
+                preds = (preds > 0.5).long()
+            else:
+                preds = torch.argmax(outputs, dim=1)
 
-    return torch.stack(class_ious).mean().item()
+            masks = masks.long()
+
+            # TorchMetrics
+            batch_mIoU      = miou_metric(preds, masks).item()
+            batch_precision = prec_metric(preds, masks).item()
+            batch_recall    = recall_metric(preds, masks).item()
+            batch_f1        = f1_metric(preds, masks).item()
+
+            batch_size = images.size(0)
+            mIoU      += batch_mIoU      * batch_size
+            precision += batch_precision * batch_size
+            recall    += batch_recall    * batch_size
+            f1        += batch_f1        * batch_size
+            # Q = Dice * mIoU
+            q         += (batch_f1 * batch_mIoU) * batch_size
+
+    # Averages
+    avg_loss        = val_loss    / dataset_size if criterion else 0.0
+    avg_f1          = f1          / dataset_size
+    avg_mIoU        = mIoU        / dataset_size
+    avg_precision   = precision   / dataset_size
+    avg_recall      = recall      / dataset_size
+    avg_q           = q           / dataset_size
+
+    if print_stats:
+        print(
+            f"Loss: {avg_loss:.4f} "
+            f"F1: {avg_f1:.4f} mIoU: {avg_mIoU:.4f} "
+            f"Prec: {avg_precision:.4f} "
+            f"Recall: {avg_recall:.4f} Q: {avg_q:.4f}"
+        )
+
+    return avg_loss, avg_f1, avg_mIoU, avg_precision, avg_recall, avg_q
 
 
+# In[ ]:
 
-#LOSS FUNCTION 1 CLASSE
+
+from enum import Enum
+
+class Losses(Enum):
+    CrossEntropyLoss    = 0
+    BCEWithLogitsLoss   = 1
+    BCEDiceLoss         = 2
+
+#BCE + Dice Loss (for binary segmentation)
 class BCEDiceLoss(nn.Module):
     def __init__(self, bce_weight=0.5, smooth=1e-6):
         super().__init__()
@@ -178,11 +181,13 @@ class BCEDiceLoss(nn.Module):
         # Thoughtful combination
         loss = self.bce_weight * bce_loss + (1 - self.bce_weight) * dice_loss
         return loss
-
+    
 
 
 # In[ ]:
 
+
+from types import FunctionType
 
 class Trainer:
 
@@ -192,27 +197,33 @@ class Trainer:
     scheduler     = None
     learning_rate = None
 
-    #This class only trains segmentation with 1 class
-    #If more is needed, use SemanticTrainer
-    num_classes   = 2
-
-    def __init__(self, model_filename=None, model_dir=None, info={}, save_xlsx=False, load_best=True, device=None, rewrite_model=False, 
-                 loss_function='BCEDiceLoss'):
+    def __init__(self, 
+                 model_filename=None, 
+                 model_dir=None, 
+                 info={}, 
+                 save_xlsx=False, 
+                 load_best=True, 
+                 device=None, 
+                 rewrite_model=False, 
+                 num_classes = 2,
+                 loss_function=Losses.BCEDiceLoss):
 
         if save_xlsx:
             if model_filename is None:
                 raise Exception("model_filename is mandatory when with save_xlsx == True")
-        self.save_xlsx = save_xlsx
-        self.load_best = load_best
+        
+        self.save_xlsx     = save_xlsx
+        self.load_best     = load_best
+        self.num_classes   = num_classes
         self.loss_function = loss_function
 
-        #saves the model name and directory
+        # saves the model name and directory
         self.model_filename = model_filename
         if model_dir is None:
             model_dir = model_filename
         self.model_dir = model_dir
 
-        #if at least the model name is passed
+        # if at least the model name is passed
         if self.model_filename is not None:
             self.model_file_dir = self.model_dir + "/" + self.model_filename
             self.hist_name = self.model_file_dir.replace('.pth', '.xlsx')
@@ -231,12 +242,12 @@ class Trainer:
             if os.path.exists(self.last_path):
                 os.remove(self.last_path)
 
-        #extra information to be saved in xlsx
+        # extra information to be saved in xlsx
         self.info = info
-        #index of the sample image that will be used
-        #to save output during training
+        # index of the sample image that will be used
+        # to save output during training
         self.sample_img_fixed_index = 0
-        #Makes some initializations
+        # Makes some initializations
         self.create_criterion()
 
         if device is None:
@@ -244,47 +255,60 @@ class Trainer:
         else:
             self.device = device
         print("Device:",self.device)
-
-
+    
 
     def create_criterion(self):
-        self.info['loss_function'] = self.loss_function
-        if self.loss_function == 'BCEWithLogitsLoss':
-            self.criterion = nn.BCEWithLogitsLoss()
-        elif self.loss_function == 'BCEDiceLoss':
-            self.criterion = BCEDiceLoss(bce_weight=0.5)
-        #elif self.loss_function == 'BCEDiceLossMulticlass': #Not yet available here
-        #    self.criterion = BCEDiceLossMulticlass(bce_weight=0.5)
-        else:
-            raise ValueError(f'Loss function {self.loss_function} not found.')
-        print("Loss function:", self.loss_function)
+        # If the loss is present in the Losses enum
+        if isinstance(self.loss_function, Losses):    
+            self.info['loss_function'] = self.loss_function
 
+            if self.loss_function == Losses.CrossEntropyLoss:
+                self.criterion = nn.CrossEntropyLoss(ignore_index=255)
+            elif self.loss_function == Losses.BCEWithLogitsLoss:
+                self.criterion = nn.BCEWithLogitsLoss()
+            elif self.loss_function == Losses.BCEDiceLoss:
+                self.criterion = BCEDiceLoss(bce_weight=0.5)
 
+        # otherwise you cand pass a custom function
+        elif isinstance(self.loss_function, FunctionType):
+            self.info['loss_function'] = self.loss_function.__name__
+            self.criterion = self.loss_function
 
-
+        elif isinstance(self.loss_function, object):
+            self.info['loss_function'] = self.loss_function.__class__.__name__
+            self.criterion             = self.loss_function
+        
+            
+        
+        
+    
     def create_scheduler(self, patience=10, factor=0.5, mode='max'):
         self.info['scheduler'] = "ReduceLROnPlateau(optimizer, mode='max', patience=10, factor=0.5, verbose=True)"
         self.scheduler = ReduceLROnPlateau(self.optimizer, 
                                       mode=mode, 
                                       patience=patience, 
                                       factor=factor)
-
-
+        
+        
 
     def create_optimizer(self):
         self.info['optimizer'] = f"optim.Adam(self.model.parameters(), lr={self.learning_rate})"
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
 
-
-
+    
+    
     def train_loop(self, images, masks, epoch):
-        outputs     = self.get_model_output(images)
+        outputs     = self.model(images)
 
-        outputs_s   = outputs.squeeze(1)
-        masks_s     = masks.squeeze(1).float()
+        if self.num_classes == 2:
+            outputs   = outputs.squeeze(1)
+            masks_s   = masks.squeeze(1).float()
+        else:
+            outputs   = self.model(images)
+            masks_s   = masks.long().squeeze(1)
 
-        loss    = self.criterion(outputs_s, masks_s)
+        loss    = self.criterion(outputs, masks_s)
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -292,24 +316,21 @@ class Trainer:
         train_loss = loss.item() * images.size(0)
 
         return train_loss
+    
+    
 
 
-
-    def update_history(self, history, train_loss=None, loss=None, dice=None, miou=None,
-                   iou=None, precision=None, recall=None, f1=None, q=None, 
-                   elapsed_time=None, images_per_sec=None, started=None):
+    def update_history(self, history, train_loss=None, loss=None, f1=None, miou=None,
+                            precision=None, recall=None, q=None, 
+                            elapsed_time=None, images_per_sec=None, started=None):
         if train_loss is not None:
             history["train_loss"].append(train_loss)
         if loss is not None:
             history["loss"].append(loss)
-        if dice is not None:
-            history["dice"].append(dice)
-        if miou is not None:
-            history["miou"].append(miou)
         if f1 is not None:
             history["f1"].append(f1)
-        if iou is not None:
-            history["iou"].append(iou)
+        if miou is not None:
+            history["miou"].append(miou)
         if precision is not None:
             history["precision"].append(precision)
         if recall is not None:
@@ -324,7 +345,7 @@ class Trainer:
             history["started"].append(started)
 
 
-
+    
     def print_last_history_stats(self):
             def format_line(title, epoch_idx):
                 epoch = epoch_idx + 1
@@ -337,10 +358,8 @@ class Trainer:
                     f" Epoch [{epoch}]"
                     f" - Loss: {values.get('train_loss', float('nan')):.4f}"
                     f" Val Loss: {values.get('loss', float('nan')):.4f}"
-                    f" Dice: {values.get('dice', float('nan')):.4f}"
-                    f" mIoU: {values.get('miou', float('nan')):.4f}"
                     f" F1-score: {values.get('f1', float('nan')):.4f}"
-                    f" IoU: {values.get('iou', float('nan')):.4f}"
+                    f" mIoU: {values.get('miou', float('nan')):.4f}"
                     f" Precision: {values.get('precision', float('nan')):.4f}"
                     f" Recall: {values.get('recall', float('nan')):.4f}"
                     f" Q: {values.get('q', float('nan')):.4f}"
@@ -354,12 +373,12 @@ class Trainer:
                     line += f" CPU_FPS: {cpu_fps:.2f}"
                 return line
 
-            # best time (highest Dice)
-            best_epoch = int(max(range(len(self.val_history["dice"])), key=lambda i: self.val_history["dice"][i]))
+            # best time (highest F1)
+            best_epoch = int(max(range(len(self.val_history["f1"])), key=lambda i: self.val_history["f1"][i]))
             print(format_line("Best model", best_epoch))
 
             # last season
-            last_epoch = len(self.val_history["dice"]) - 1
+            last_epoch = len(self.val_history["f1"]) - 1
             print(format_line("Latest model", last_epoch))
 
 
@@ -390,14 +409,14 @@ class Trainer:
             chart = workbook.add_chart({'type': 'line'})
 
             # The 'epoch' column is now in column 0
-            # Assuming 'val_dice' is in column 5 and 'val_IoU' in 6 (or adjust this dynamically)
-            col_dice = df_val_history.columns.get_loc('dice')
+            # Assuming 'val_f1' is in column 5 and 'val_IoU' in 6 (or adjust this dynamically)
+            col_f1 = df_val_history.columns.get_loc('f1')
             col_iou  = df_val_history.columns.get_loc('miou')
 
             chart.add_series({
-                'name':       'dice',
+                'name':       'f1',
                 'categories': ['val_history', 1, 0, len(df_val_history), 0],  # column 0 = epoch
-                'values':     ['val_history', 1, col_dice, len(df_val_history), col_dice],
+                'values':     ['val_history', 1, col_f1, len(df_val_history), col_f1],
             })
             chart.add_series({
                 'name':       'mIoU',
@@ -416,8 +435,8 @@ class Trainer:
 
             worksheet.insert_chart('K2', chart)
 
-
-
+    
+    
     def load_xlsx_history(self):
         # Read all sheets in the file
         xls = pd.read_excel(self.hist_name, sheet_name=None)
@@ -450,12 +469,12 @@ class Trainer:
         #if the model to be loaded has not been passed
         if self.model is None:
             raise Exception("You need to pass the model object in the 'model' parameter")
-
+        
         if self.optimizer is None:
             self.create_optimizer()
         if self.scheduler is None:
             self.create_scheduler()
-
+        
         #loads the model from the .pth file
         checkpoint = torch.load(model_file_dir, weights_only=False)
         #retrieves the states of the file
@@ -471,7 +490,7 @@ class Trainer:
             start_epoch, start_time = self.load_xlsx_history()
             return best_score, epoch, start_epoch, start_time
         return best_score, epoch
-
+    
     def save_model(self, path, epoch, best_score):
         torch.save({
                 'epoch': epoch,
@@ -480,84 +499,12 @@ class Trainer:
                 'scheduler_state_dict': self.scheduler.state_dict(),
                 'best_acc': best_score
                 }, path)
-
+    
     def get_device(self):
         return self.device
 
 
-    def get_model_output(self,images):
-        return self.model(images)
-
-
-    def val_loop(self, images, masks):
-        outputs     = self.get_model_output(images)
-        loss        = self.criterion(outputs, masks)
-        val_loss    = loss.item() * images.size(0)
-
-        #make the threshold
-        preds = torch.sigmoid(outputs)
-        preds = (preds > 0.5).long()
-        masks = masks.long()
-
-        #compute the metrics
-        dice, mIoU, precision, recall, f1, q = compute_segmentation_metrics(preds, masks, num_classes=self.num_classes)
-        IoU = compute_iou(preds, masks, num_classes=self.num_classes)
-        val_dice      = dice      * images.size(0)
-        val_mIoU      = mIoU      * images.size(0)
-        val_IoU       = IoU       * images.size(0)
-        val_precision = precision * images.size(0)
-        val_recall    = recall    * images.size(0)
-        val_f1        = f1        * images.size(0)
-        val_q         = q         * images.size(0)
-        return val_loss, val_dice, val_mIoU, val_IoU, val_precision, val_recall, val_f1, val_q
-
-    def evaluate_model(self, data_loader, print_stats=False, model=None):
-        if model is not None:
-            self.model = model
-        self.model.eval()
-        device           = self.get_device()
-        loss        = 0.0
-        dice        = 0.0
-        mIoU        = 0.0
-        IoU         = 0.0
-        precision   = 0.0
-        recall      = 0.0
-        f1          = 0.0
-        q           = 0.0
-        with torch.no_grad():
-            for images, masks in data_loader:
-                images = images.to(device)
-                masks  = masks.to(device)
-                iloss, idice, imIoU, iIoU, iprecision, irecall, if1, iq = self.val_loop(images, masks)
-
-                loss      += iloss
-                dice      += idice
-                mIoU      += imIoU
-                IoU       += iIoU
-                precision += iprecision
-                recall    += irecall
-                f1        += if1
-                q         += iq
-
-        avg_loss        = loss / len(data_loader.dataset)
-        avg_dice        = dice / len(data_loader.dataset)
-        avg_mIoU        = mIoU / len(data_loader.dataset)
-        avg_IoU         = IoU  / len(data_loader.dataset)
-        avg_precision   = precision   / len(data_loader.dataset)
-        avg_recall      = recall   / len(data_loader.dataset)
-        avg_f1          = f1    / len(data_loader.dataset)
-        avg_q           = q    / len(data_loader.dataset)
-
-        if print_stats:
-            stats = (f"Loss: {avg_loss:.4f} " 
-                    f"Dice: {avg_dice:.4f} mIoU: {avg_mIoU:.4f} F1: {avg_f1:.4f}  IoU: {avg_IoU:.4f} " 
-                    f"Prec: {avg_precision:.4f} " 
-                    f"Recall: {avg_recall:.4f} Q: {avg_q:.4f} ")
-            print(stats)
-
-        return avg_loss, avg_dice, avg_mIoU, avg_IoU, avg_precision, avg_recall, avg_f1, avg_q
-
-
+        
 
     def train(self, model, 
                     train_loader, 
@@ -577,7 +524,8 @@ class Trainer:
                     scheduler_patience=10,
                     # early_stop_patience=ends training after 20 epochs if acc improves
                     early_stop_patience=20,
-                    measure_cpu_speed=True
+                    measure_cpu_speed=True,
+                    print_val_stats=False
                     ):
 
         torch.backends.cudnn.benchmark = True
@@ -593,21 +541,20 @@ class Trainer:
         batch_size          = train_loader.batch_size
 
         trainable_parameters = count_trainable_parameters(model)
-        print("trainable_parameters:", trainable_parameters)
+        print("Trainable_parameters:", trainable_parameters)
+        print("Loss function:", self.loss_function)
         self.info['dataset_name']         = train_loader.dataset.__module__
         self.info['dataset_batch_size']   = batch_size
         self.info['trainable_parameters'] = trainable_parameters
         images, labels = next(iter(train_loader))
         self.info['dataset_resolution']   = f"{images.shape[2]} x {images.shape[3]}"
-
+        
 
         self.val_history = {
             "train_loss":     [],
             "loss":           [],
-            "dice":           [],
-            "miou":           [],
             "f1":             [],
-            "iou":            [],
+            "miou":           [],
             "precision":      [],
             "recall":         [],
             "q":              [],
@@ -616,7 +563,7 @@ class Trainer:
             "started":        [],
         }
         self.test_history = {k: [] for k in self.val_history}
-
+        
 
         #prints everything on the same line
         tqdm_disable = print_every!=None
@@ -626,7 +573,7 @@ class Trainer:
             tqdm_disable = True
 
 
-
+        
         #if the model name was passed
         if self.model_filename is not None:
             #create directories
@@ -654,20 +601,20 @@ class Trainer:
                     if start_epoch >= num_epochs:
                         self.print_last_history_stats()
                         return self.model
-
+            
 
 
         model.to(device)
         self.create_optimizer()
         self.create_scheduler(patience=scheduler_patience)
         early_stopper = EarlyStopping(patience=early_stop_patience, mode='max')
-
-
+    
+        
 
         ## Training
         epoch = start_epoch
         for epoch in range(start_epoch, num_epochs):
-
+            
             model.train()
             train_loss = 0.0
             for images, masks in tqdm(train_loader, desc=f"Training Epoch {epoch+1}", disable=tqdm_disable):
@@ -677,46 +624,57 @@ class Trainer:
                 train_loss += self.train_loop(images, masks, epoch)
 
             avg_train_loss = train_loss / len(train_loader.dataset)
-
+            
 
             ## Validation
-            avg_val_loss, avg_val_dice, avg_val_mIoU, avg_val_IoU, avg_val_precision, avg_val_recall, avg_val_f1, avg_val_q = self.evaluate_model(val_loader)
+            avg_val_loss, avg_val_f1, avg_val_mIoU, avg_val_precision, avg_val_recall, avg_val_q = evaluate_model(self.model, val_loader, num_classes=self.num_classes, criterion=self.criterion)
 
-
-            ##Test
-            avg_test_loss, avg_test_dice, avg_test_mIoU, avg_test_IoU, avg_test_precision, avg_test_recall, avg_test_f1, avg_test_q = self.evaluate_model(test_loader)
+            ## Test 
+            avg_test_loss, avg_test_f1, avg_test_mIoU, avg_test_precision, avg_test_recall, avg_test_q = evaluate_model(self.model, test_loader, num_classes=self.num_classes, criterion=self.criterion)
 
             elapsed     = time.time() - start_time
             elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
             current_lr  = self.optimizer.param_groups[0]['lr']
-            stats = (f"Epoch [{epoch+1}/{num_epochs}] - " 
-                    f"Loss: {avg_train_loss:.4f} Val Loss: {avg_val_loss:.4f} " 
-                    f"Dice: {avg_val_dice:.4f} mIoU: {avg_val_mIoU:.4f} F1: {avg_val_f1:.4f} IoU: {avg_val_IoU:.4f} " 
-                    f"Prec: {avg_val_precision:.4f} " 
-                    f"Recall: {avg_val_recall:.4f} Q: {avg_val_q:.4f} " 
-                    f"Time: {elapsed_str} LR:{current_lr:.6f}")
 
+            
+            
+            test_stats = (f"Epoch [{epoch+1}/{num_epochs}] [test_set]: " 
+                    f"Loss: {avg_train_loss:.4f}  " 
+                    f"F1: {avg_test_f1:.4f} mIoU: {avg_test_mIoU:.4f} " 
+                    f"Prec: {avg_test_precision:.4f} " 
+                    f"Recall: {avg_test_recall:.4f} Q: {avg_test_q:.4f} " 
+                    f"Time: {elapsed_str} LR:{current_lr:.6f}")
+            
+            # The validation stats is used only during training
+            # for papers we use the test_stats, so we will print only test_stats
+            # but you can print val_stats and test_stats together with print_val_stats=True
+            val_stats = (f" - [val_set]: Loss: {avg_val_loss:.4f} " 
+                    f"F1: {avg_val_f1:.4f} mIoU: {avg_val_mIoU:.4f} " 
+                    f"Prec: {avg_val_precision:.4f} " 
+                    f"Recall: {avg_val_recall:.4f} Q: {avg_val_q:.4f} ")
+
+            if print_val_stats:
+                test_stats += val_stats
 
             if print_every is None:
-                print(stats,end=print_end)
+                print(test_stats,end=print_end)
             else:
                 if (epoch+1) % print_every == 0:
-                    print(stats,end=print_end)
-
+                    print(val_stats,end=print_end)
+                    print(test_stats,end=print_end)
+            
 
             images_per_sec = (len(train_loader) * batch_size) / elapsed
-
+            
             ## Saves the evolution of the network
             self.update_history(
                 self.val_history,
                 train_loss=avg_train_loss,
                 loss=avg_val_loss,
-                dice=avg_val_dice,
+                f1=avg_val_f1,
                 miou=avg_val_mIoU,
-                iou=avg_val_IoU,
                 precision=avg_val_precision,
                 recall=avg_val_recall,
-                f1=avg_val_f1,
                 q=avg_val_q,
                 elapsed_time=elapsed_str,
                 images_per_sec=images_per_sec,
@@ -726,56 +684,61 @@ class Trainer:
                 self.test_history,
                 train_loss=avg_train_loss,
                 loss=avg_test_loss,
-                dice=avg_test_dice,
+                f1=avg_test_f1,
                 miou=avg_test_mIoU,
-                iou=avg_test_IoU,
                 precision=avg_test_precision,
                 recall=avg_test_recall,
-                f1=avg_test_f1,
                 q=avg_test_q,
                 elapsed_time=elapsed_str,
                 images_per_sec=images_per_sec,
                 started=('started' if not started else '')
             )
-
-
-
+            
 
             started = True
 
-
-            # The avg_val_dice will be observed for the scheduler and early_stopper
+            # The avg_val_f1 will be observed for the scheduler and early_stopper
 
             # reduces the learning rate if the score does not improve
-            self.scheduler.step(avg_val_dice)
+            self.scheduler.step(avg_val_f1)
 
             # for training if you don't improve in X times
-            early_stopper.step(avg_val_dice)
+            early_stopper.step(avg_val_f1)
             if early_stopper.early_stop:
                 print(f"Stopping at epoch {epoch+1} by early stopping.")
                 break
 
             ## Save the best model so far
-            if avg_val_dice > best_score:
-                best_score = avg_val_dice
-
+            if avg_val_f1 > best_score:
+                best_score = avg_val_f1
+                
                 if self.model_file_dir is not None:
                     #save the model at the best time
                     self.save_model(self.best_path, epoch, best_score)
                     current_lr  = self.optimizer.param_groups[0]['lr']
-                    best_stats = (f"Epoch [{epoch+1}/{num_epochs}] - " 
-                                f"Loss: {avg_train_loss:.4f} Val Loss: {avg_val_loss:.4f} " 
-                                f"Dice: {avg_val_dice:.4f} mIoU: {avg_val_mIoU:.4f} F1: {avg_val_f1:.4f} IoU: {avg_val_IoU:.4f} " 
-                                f"Prec: {avg_val_precision:.4f} " 
-                                f"Recall: {avg_val_recall:.4f} Q: {avg_val_q:.4f} " 
+                                        
+                    best_test_stats = (f"Epoch [{epoch+1}/{num_epochs}] [test_set]:" 
+                                f"Loss: {avg_train_loss:.4f} Val Loss: {avg_test_loss:.4f} " 
+                                f"F1: {avg_test_f1:.4f} mIoU: {avg_test_mIoU:.4f} " 
+                                f"Prec: {avg_test_precision:.4f} " 
+                                f"Recall: {avg_test_recall:.4f} Q: {avg_test_q:.4f} " 
                                 f"Time: {elapsed_str} LR:{current_lr:.6f}")
+                    
+                    best_val_stats = (f" - [val_set]: Loss: {avg_val_loss:.4f} " 
+                                f"F1: {avg_val_f1:.4f} mIoU: {avg_val_mIoU:.4f} " 
+                                f"Prec: {avg_val_precision:.4f} " 
+                                f"Recall: {avg_val_recall:.4f} Q: {avg_val_q:.4f} ")
+                    
+
+                    if print_val_stats:
+                        best_test_stats += best_val_stats
                     if print_every is None and verbose > 1:
-                        print("✔ Best model saved:", best_stats, end=print_end)
+                        print("✔ Best model saved:", best_test_stats, end=print_end)
                     #save excel to the current moment
                     if self.save_xlsx:
                         self.do_save_xlsx()
-
-
+            
+                
 
             #Saves the network every
             if save_every is not None and (epoch + 1) % save_every == 0:
@@ -786,32 +749,38 @@ class Trainer:
                     print("Saved last as", last_model_file_dir, end=print_end)
 
 
-
-        last_stats = (f"Epoch [{epoch+1}/{num_epochs}] - " 
-                    f"Loss: {avg_train_loss:.4f} Val Loss: {avg_val_loss:.4f} " 
-                    f"Dice: {avg_val_dice:.4f} mIoU: {avg_val_mIoU:.4f} F1: {avg_val_f1:.4f} IoU: {avg_val_IoU:.4f} " 
-                    f"Prec: {avg_val_precision:.4f} " 
-                    f"Recall: {avg_val_recall:.4f} Q: {avg_val_q:.4f} " 
+                
+        last_test_stats = (f"Epoch [{epoch+1}/{num_epochs}] [test_set]: " 
+                    f"Loss: {avg_train_loss:.4f} Val Loss: {avg_test_loss:.4f} " 
+                    f"F1: {avg_test_f1:.4f} mIoU: {avg_test_mIoU:.4f} " 
+                    f"Prec: {avg_test_precision:.4f} " 
+                    f"Recall: {avg_test_recall:.4f} Q: {avg_test_q:.4f} " 
                     f"Time: {elapsed_str} LR:{current_lr:.6f}")
-
+        
+        last_val_stats = (f" - [val_set]: Loss: {avg_val_loss:.4f} " 
+                    f"F1: {avg_val_f1:.4f} mIoU: {avg_val_mIoU:.4f} " 
+                    f"Prec: {avg_val_precision:.4f} " 
+                    f"Recall: {avg_val_recall:.4f} Q: {avg_val_q:.4f} ")
+        if print_val_stats:
+            last_test_stats += last_val_stats
 
 
         #calculates the FPS of the model
         self.info['GPU_FPS'], self.info['GPU_time_per_image'], self.info['CPU_FPS'], self.info['CPU_time_per_image'] = measure_inference_speed(self.model, 
                                                                                                                                                val_loader, 
                                                                                                                                                measure_cpu_speed=measure_cpu_speed)
-
+          
         print("")
-        if best_stats:
-            print("Best model:\r\n", best_stats)
-        print("Latest model:\r\n", last_stats + '\r\n GPU_FPS:',self.info['GPU_FPS'], ' CPU_FPS:',self.info['CPU_FPS'])
+        if best_test_stats:
+            print("Best model:\r\n", best_test_stats)
+        print("Latest model:\r\n", last_test_stats + '\r\n GPU_FPS:',self.info['GPU_FPS'], ' CPU_FPS:',self.info['CPU_FPS'])
 
 
         if self.model_file_dir is not None:
             self.save_model(self.model_file_dir, epoch, best_score)
             print("Saved as", self.model_file_dir)
 
-
+        
         if self.save_xlsx:
             # Write the excel file with history
             self.do_save_xlsx()
@@ -830,90 +799,88 @@ if __name__ == '__main__':
 # In[ ]:
 
 
-def check_masks_for_ce_loss(masks, num_classes=3, ignore_index=255):
-    """
-    Checks a mask for invalid values ​​before CrossEntropyLoss.
+# def check_masks_for_ce_loss(masks, num_classes=3, ignore_index=255):
+#     """
+#     Checks a mask for invalid values ​​before CrossEntropyLoss.
+    
+#     masks: tensor [B,H,W] ou [B,1,H,W]
+#     """
+#     if masks.ndim == 4:
+#         masks = masks.squeeze(1)  # [b,h,w]
 
-    masks: tensor [B,H,W] ou [B,1,H,W]
-    """
-    if masks.ndim == 4:
-        masks = masks.squeeze(1)  # [b,h,w]
+#     invalid_mask = (masks < 0) | ((masks >= num_classes) & (masks != ignore_index))
+#     has_invalid = invalid_mask.any()
 
-    invalid_mask = (masks < 0) | ((masks >= num_classes) & (masks != ignore_index))
-    has_invalid = invalid_mask.any()
-
-    if has_invalid:
-        print("Invalid values ​​found in masks!")
-        for b in range(masks.size(0)):
-            unique_vals = torch.unique(masks[b])
-            if ((unique_vals >= num_classes) & (unique_vals != ignore_index)).any() or (unique_vals < 0).any():
-                print(f"Batch {b}: unique values -> {unique_vals.tolist()}")
-    else:
-        print("All masks valid for CrossEntropyLoss.")
-
-
-class MulticlassTrainer(Trainer):
-
-    def __init__(self, num_classes, model_filename=None, model_dir=None, info={}, save_xlsx=False, loss_function='CrossEntropyLoss'):
-        #Correct the loss_function if necessary
-        if loss_function == 'BCEWithLogitsLoss':
-            loss_function = 'CrossEntropyLoss'
-
-        super(MulticlassTrainer, self).__init__(model_filename=model_filename, model_dir=model_dir, info=info, save_xlsx=save_xlsx, loss_function=loss_function)
-        self.num_classes = num_classes
+#     if has_invalid:
+#         print("Invalid values ​​found in masks!")
+#         for b in range(masks.size(0)):
+#             unique_vals = torch.unique(masks[b])
+#             if ((unique_vals >= num_classes) & (unique_vals != ignore_index)).any() or (unique_vals < 0).any():
+#                 print(f"Batch {b}: unique values -> {unique_vals.tolist()}")
+#     else:
+#         print("All masks valid for CrossEntropyLoss.")
 
 
-    def create_criterion(self):
+# class MulticlassTrainer(Trainer):
 
-        if self.loss_function == 'CrossEntropyLoss':
-            self.info['loss_function'] = 'CrossEntropyLoss'
-            self.criterion = nn.CrossEntropyLoss(ignore_index=255)
-        else:
-            raise ValueError(f'Loss function {self.loss_function} not found.') 
+#     def __init__(self, num_classes, model_filename=None, model_dir=None, info={}, save_xlsx=False, loss_function='CrossEntropyLoss'):
+#         #Correct the loss_function if necessary
+#         if loss_function == 'BCEWithLogitsLoss':
+#             loss_function = 'CrossEntropyLoss'
 
+#         super(MulticlassTrainer, self).__init__(model_filename=model_filename, model_dir=model_dir, info=info, save_xlsx=save_xlsx, loss_function=loss_function)
+#         self.num_classes = num_classes
+        
+        
+#     def create_criterion(self):
+#         if self.loss_function == 'CrossEntropyLoss':
+#             self.info['loss_function'] = 'CrossEntropyLoss'
+#             self.criterion = nn.CrossEntropyLoss(ignore_index=255)
+#         else:
+#             raise ValueError(f'Loss function {self.loss_function} not found.') 
 
+        
+    
+#     # def train_loop(self, images, masks, epoch):
+#     #     outputs     = self.model(images)
+#     #     masks_s     = masks.long().squeeze(1)
 
-    def train_loop(self, images, masks, epoch):
-        outputs     = self.get_model_output(images)
+#     #     loss    = self.criterion(outputs, masks_s)
 
-        masks_s     = masks.long().squeeze(1)
+#     #     self.optimizer.zero_grad()
+#     #     loss.backward()
+#     #     self.optimizer.step()
+#     #     train_loss = loss.item() * images.size(0)
 
-        loss    = self.criterion(outputs, masks_s)
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        train_loss = loss.item() * images.size(0)
-
-        return train_loss
-
-
-    def val_loop(self, images, masks):
-        outputs     = self.get_model_output(images)
-
-        masks_s     = masks.long().squeeze(1)
-
-
-        try:
-            loss        = self.criterion(outputs, masks_s)
-            val_loss    = loss.item() * images.size(0)
-        except Exception as e:
-            check_masks_for_ce_loss(masks_s, num_classes=self.num_classes, ignore_index=255)
-            raise
-
-        preds       = torch.argmax(outputs, dim=1)
-        dice, mIoU, precision, recall, f1, q = compute_segmentation_metrics(preds, masks, self.num_classes)
-        IoU = compute_iou(preds, masks, num_classes=self.num_classes)
-
-        val_dice      = dice      * images.size(0)
-        val_mIoU      = mIoU      * images.size(0)
-        val_IoU       = IoU       * images.size(0)
-        val_precision = precision * images.size(0)
-        val_recall    = recall    * images.size(0)
-        val_f1        = f1        * images.size(0)
-        val_q         = q         * images.size(0)
-
-        return val_loss, val_dice, val_mIoU, val_IoU, val_precision, val_recall, val_f1, val_q
+#     #     return train_loss
 
 
+#     # def val_loop(self, images, masks):
+#     #     outputs     = model(images)
+
+#     #     masks_s     = masks.long().squeeze(1)
+
+        
+#     #     try:
+#     #         loss        = self.criterion(outputs, masks_s)
+#     #         val_loss    = loss.item() * images.size(0)
+#     #     except Exception as e:
+#     #         check_masks_for_ce_loss(masks_s, num_classes=self.num_classes, ignore_index=255)
+#     #         raise
+        
+#     #     preds       = torch.argmax(outputs, dim=1)
+#     #     dice, mIoU, precision, recall, f1, q = compute_segmentation_metrics(preds, masks, self.num_classes)
+#     #     IoU = compute_iou(preds, masks, num_classes=self.num_classes)
+
+#     #     val_dice      = dice      * images.size(0)
+#     #     val_mIoU      = mIoU      * images.size(0)
+#     #     val_IoU       = IoU       * images.size(0)
+#     #     val_precision = precision * images.size(0)
+#     #     val_recall    = recall    * images.size(0)
+#     #     val_f1        = f1        * images.size(0)
+#     #     val_q         = q         * images.size(0)
+
+#     #     return val_loss, val_dice, val_mIoU, val_IoU, val_precision, val_recall, val_f1, val_q
+    
+    
 

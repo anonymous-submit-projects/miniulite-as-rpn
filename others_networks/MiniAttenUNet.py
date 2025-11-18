@@ -1,6 +1,7 @@
-# Para este script funcionar primeiro é necessário clonar o repositório original da Attention U-Net utilizada neste trabalho
+# For this script to work, you must first clone the original Attention U-Net repository used in this work
 # git clone https://github.com/LeeJunHyun/Image_Segmentation/
-# adicione no sys.path.append o caminho para o repositorio baixado
+# then add the path to the downloaded repository in sys.path.append
+
 import torch
 from network import *
 
