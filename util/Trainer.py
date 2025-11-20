@@ -70,15 +70,14 @@ from torchmetrics.classification import (
 #from torchmetrics.segmentation import DiceScore, MeanIoU
 
 
-def evaluate_model(model, data_loader, num_classes=2, print_stats=False, criterion=None, device='cuda'):
-
+def evaluate_model(model, data_loader, num_classes=2, print_stats=False, criterion=None, device='cuda', ignore_index=None):
     model.eval()
     #dice_metric      = DiceScore(num_classes=num_classes, average="macro", input_format='index', aggregation_level='global').to(device)
     #miou_metric      = MeanIoU(num_classes=num_classes, input_format='index').to(device)
-    miou_metric      = MulticlassJaccardIndex(num_classes=num_classes, average="macro", ignore_index=255).to(device)
-    prec_metric      = MulticlassPrecision(num_classes=num_classes, average="macro", ignore_index=255).to(device)
-    recall_metric    = MulticlassRecall(num_classes=num_classes, average="macro", ignore_index=255).to(device)
-    f1_metric        = MulticlassF1Score(num_classes=num_classes, average="macro", ignore_index=255).to(device)
+    miou_metric      = MulticlassJaccardIndex(num_classes=num_classes, average="macro", ignore_index=ignore_index).to(device)
+    prec_metric      = MulticlassPrecision(num_classes=num_classes, average="macro", ignore_index=ignore_index).to(device)
+    recall_metric    = MulticlassRecall(num_classes=num_classes, average="macro", ignore_index=ignore_index).to(device)
+    f1_metric        = MulticlassF1Score(num_classes=num_classes, average="macro", ignore_index=ignore_index).to(device)
 
     val_loss    = 0.0
     mIoU        = 0.0
@@ -196,6 +195,8 @@ class Trainer:
     optimizer     = None
     scheduler     = None
     learning_rate = None
+    last_stats    = None
+    ignore_index  = None
 
     def __init__(self, 
                  model_filename=None, 
@@ -206,7 +207,8 @@ class Trainer:
                  device=None, 
                  rewrite_model=False, 
                  num_classes = 2,
-                 loss_function=Losses.BCEDiceLoss):
+                 loss_function=Losses.BCEDiceLoss,
+                 ignore_index=None):
 
         if save_xlsx:
             if model_filename is None:
@@ -215,6 +217,7 @@ class Trainer:
         self.save_xlsx     = save_xlsx
         self.load_best     = load_best
         self.num_classes   = num_classes
+        self.ignore_index  = ignore_index
         self.loss_function = loss_function
 
         # saves the model name and directory
@@ -263,7 +266,7 @@ class Trainer:
             self.info['loss_function'] = self.loss_function
 
             if self.loss_function == Losses.CrossEntropyLoss:
-                self.criterion = nn.CrossEntropyLoss(ignore_index=255)
+                self.criterion = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
             elif self.loss_function == Losses.BCEWithLogitsLoss:
                 self.criterion = nn.BCEWithLogitsLoss()
             elif self.loss_function == Losses.BCEDiceLoss:
@@ -504,6 +507,8 @@ class Trainer:
         return self.device
 
 
+    def get_last_stats(self):
+        return self.last_stats
         
 
     def train(self, model, 
@@ -511,13 +516,13 @@ class Trainer:
                     val_loader,
                     test_loader, 
                     num_epochs=50, 
-                    #saves the model every
+                    # saves the model every
                     save_every=None,
-                    #prints the tempo every
+                    # prints the tempo every
                     print_every=None,
-                    #continue training where you left off
+                    # continue training where you left off
                     continue_from_last=False,
-                    #verbose==1 prints the training on the same line
+                    # verbose==1 prints the training on the same line
                     verbose=3,
                     learning_rate=1e-4,
                     # scheduler patience=decreases IR after 10 epochs without improvement in acc
@@ -525,7 +530,9 @@ class Trainer:
                     # early_stop_patience=ends training after 20 epochs if acc improves
                     early_stop_patience=20,
                     measure_cpu_speed=True,
-                    print_val_stats=False
+                    print_val_stats=False,
+                    # run evaluate_model after loading the best or last version instead of print xlst stats
+                    re_evaluate=False
                     ):
 
         torch.backends.cudnn.benchmark = True
@@ -583,13 +590,17 @@ class Trainer:
             if os.path.exists(self.model_file_dir):
                 if self.load_best:
                     #if it already exists, load and return
-                    print("Trained model already exists (Loading better version).")
+                    print("Trained model already exists (Loading best version).")
                     self.load_model(self.best_path)
                 else:
                     #if it already exists, load and return
                     print("Trained model already exists (Loading latest version).")
                     self.load_model(self.model_file_dir)
-                self.print_last_history_stats()
+
+                if re_evaluate:
+                    self.last_stats = evaluate_model(self.model, test_loader, num_classes=self.num_classes, print_stats=True, device=device, ignore_index=self.ignore_index)
+                else:
+                    self.print_last_history_stats()
                 return model
             #if it does not exist and is a continuation of the training
             elif continue_from_last == True:
@@ -627,10 +638,11 @@ class Trainer:
             
 
             ## Validation
-            avg_val_loss, avg_val_f1, avg_val_mIoU, avg_val_precision, avg_val_recall, avg_val_q = evaluate_model(self.model, val_loader, num_classes=self.num_classes, criterion=self.criterion)
+            avg_val_loss, avg_val_f1, avg_val_mIoU, avg_val_precision, avg_val_recall, avg_val_q = evaluate_model(self.model, val_loader, num_classes=self.num_classes, criterion=self.criterion, ignore_index=self.ignore_index)
 
             ## Test 
-            avg_test_loss, avg_test_f1, avg_test_mIoU, avg_test_precision, avg_test_recall, avg_test_q = evaluate_model(self.model, test_loader, num_classes=self.num_classes, criterion=self.criterion)
+            self.last_stats = evaluate_model(self.model, test_loader, num_classes=self.num_classes, criterion=self.criterion, ignore_index=self.ignore_index)
+            avg_test_loss, avg_test_f1, avg_test_mIoU, avg_test_precision, avg_test_recall, avg_test_q = self.last_stats
 
             elapsed     = time.time() - start_time
             elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
@@ -794,93 +806,4 @@ class Trainer:
 
 if __name__ == '__main__':
     pass
-
-
-# In[ ]:
-
-
-# def check_masks_for_ce_loss(masks, num_classes=3, ignore_index=255):
-#     """
-#     Checks a mask for invalid values ​​before CrossEntropyLoss.
-    
-#     masks: tensor [B,H,W] ou [B,1,H,W]
-#     """
-#     if masks.ndim == 4:
-#         masks = masks.squeeze(1)  # [b,h,w]
-
-#     invalid_mask = (masks < 0) | ((masks >= num_classes) & (masks != ignore_index))
-#     has_invalid = invalid_mask.any()
-
-#     if has_invalid:
-#         print("Invalid values ​​found in masks!")
-#         for b in range(masks.size(0)):
-#             unique_vals = torch.unique(masks[b])
-#             if ((unique_vals >= num_classes) & (unique_vals != ignore_index)).any() or (unique_vals < 0).any():
-#                 print(f"Batch {b}: unique values -> {unique_vals.tolist()}")
-#     else:
-#         print("All masks valid for CrossEntropyLoss.")
-
-
-# class MulticlassTrainer(Trainer):
-
-#     def __init__(self, num_classes, model_filename=None, model_dir=None, info={}, save_xlsx=False, loss_function='CrossEntropyLoss'):
-#         #Correct the loss_function if necessary
-#         if loss_function == 'BCEWithLogitsLoss':
-#             loss_function = 'CrossEntropyLoss'
-
-#         super(MulticlassTrainer, self).__init__(model_filename=model_filename, model_dir=model_dir, info=info, save_xlsx=save_xlsx, loss_function=loss_function)
-#         self.num_classes = num_classes
-        
-        
-#     def create_criterion(self):
-#         if self.loss_function == 'CrossEntropyLoss':
-#             self.info['loss_function'] = 'CrossEntropyLoss'
-#             self.criterion = nn.CrossEntropyLoss(ignore_index=255)
-#         else:
-#             raise ValueError(f'Loss function {self.loss_function} not found.') 
-
-        
-    
-#     # def train_loop(self, images, masks, epoch):
-#     #     outputs     = self.model(images)
-#     #     masks_s     = masks.long().squeeze(1)
-
-#     #     loss    = self.criterion(outputs, masks_s)
-
-#     #     self.optimizer.zero_grad()
-#     #     loss.backward()
-#     #     self.optimizer.step()
-#     #     train_loss = loss.item() * images.size(0)
-
-#     #     return train_loss
-
-
-#     # def val_loop(self, images, masks):
-#     #     outputs     = model(images)
-
-#     #     masks_s     = masks.long().squeeze(1)
-
-        
-#     #     try:
-#     #         loss        = self.criterion(outputs, masks_s)
-#     #         val_loss    = loss.item() * images.size(0)
-#     #     except Exception as e:
-#     #         check_masks_for_ce_loss(masks_s, num_classes=self.num_classes, ignore_index=255)
-#     #         raise
-        
-#     #     preds       = torch.argmax(outputs, dim=1)
-#     #     dice, mIoU, precision, recall, f1, q = compute_segmentation_metrics(preds, masks, self.num_classes)
-#     #     IoU = compute_iou(preds, masks, num_classes=self.num_classes)
-
-#     #     val_dice      = dice      * images.size(0)
-#     #     val_mIoU      = mIoU      * images.size(0)
-#     #     val_IoU       = IoU       * images.size(0)
-#     #     val_precision = precision * images.size(0)
-#     #     val_recall    = recall    * images.size(0)
-#     #     val_f1        = f1        * images.size(0)
-#     #     val_q         = q         * images.size(0)
-
-#     #     return val_loss, val_dice, val_mIoU, val_IoU, val_precision, val_recall, val_f1, val_q
-    
-    
 

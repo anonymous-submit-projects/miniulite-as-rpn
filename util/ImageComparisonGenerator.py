@@ -26,7 +26,7 @@ class ImageComparisonGenerator:
             return self.model(images)
         else:
             return model(images)
-
+    
     # Helper function within the class
     def _get_sample_by_index(self, dataloader, idx):
         count = 0
@@ -43,7 +43,7 @@ class ImageComparisonGenerator:
     def _prepare_mask_vis(self, mask, num_classes=1, ignore_val=255):
         ignore_mask = (mask == ignore_val)
         mask_vis = mask.copy()
-
+        
         if num_classes > 1:
             color_map = {0:[0.9,0.9,0],1:[0.3,0.3,1],2:[0.9,0,0.9]}
             mask_rgb = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.float32)
@@ -110,225 +110,7 @@ class ImageComparisonGenerator:
             img_disp = img_disp.squeeze(0)
         img_disp = img_disp*0.5 + 0.5
         return img_disp
-
-
-
-
-    def compare_multiple_models_on_val(
-        self,
-        val_loader,
-        models,
-        model_names=None,
-        num_classes=1,
-        device="cuda",
-        max_images=None
-    ):
-        """
-        Compara múltiplos modelos no conjunto de validação.
-        Mostra imagem, GT e predições dos modelos cujo desempenho difira.
-
-        Args:
-            val_loader: dataloader de validação
-            models: lista de modelos [modelA, modelB, modelC, ...]
-            model_names: lista de nomes correspondentes aos modelos
-            num_classes: número de classes (1 = binária)
-            device: cuda ou cpu
-            max_images: máximo de amostras a exibir
-        """
-
-        if not isinstance(models, (list, tuple)):
-            raise ValueError("models deve ser uma lista de modelos [modelA, modelB, ...]")
-        if model_names is None:
-            model_names = [f"Model {i+1}" for i in range(len(models))]
-        if len(model_names) != len(models):
-            raise ValueError("O número de nomes deve corresponder ao número de modelos.")
-
-        # Move todos os modelos para o dispositivo e para modo eval
-        for m in models:
-            m.to(device)
-            m.eval()
-
-        img_count = 0
-
-        with torch.no_grad():
-            for imgs, masks in val_loader:
-                imgs = imgs.to(device)
-                masks = masks.to(device)
-
-                # forward em todos os modelos
-                outputs = [m(imgs) for m in models]
-
-                # converte para predições binárias ou categóricas
-                preds = []
-                for out in outputs:
-                    if num_classes == 1:
-                        preds.append(torch.sigmoid(out) > 0.5)
-                    else:
-                        preds.append(torch.argmax(F.softmax(out, dim=1), dim=1))
-
-                # loop por imagem individual
-                for i in range(imgs.size(0)):
-                    dice_scores = [self._dice_score(pred[i], masks[i], num_classes) for pred in preds]
-                    miou_scores = [self._miou_score(pred[i], masks[i], num_classes) for pred in preds]
-
-                    # encontra o melhor modelo
-                    best_idx = int(np.argmax(dice_scores))
-
-                    # só mostra se o primeiro modelo não for o melhor (opcional)
-                    if best_idx != 0:
-                        img_disp = self._prepare_image_disp(imgs[i].cpu())
-                        mask_np = masks[i].cpu().squeeze().numpy()
-                        gt_disp, ignore_mask = self._prepare_mask_vis(mask_np, num_classes)
-
-                        # cria predições visuais de todos os modelos
-                        pred_disps = [
-                            self._prepare_prediction_vis(out, mask_np, num_classes=num_classes, do_diff=True, ignore_mask=ignore_mask)
-                            for out in outputs
-                        ]
-
-                        # calcula pixels vermelhos para cada modelo
-                        red_counts = []
-                        for disp in pred_disps:
-                            red_pixels = np.all(disp == np.array([1.0, 0.0, 0.0], dtype=np.float32), axis=2)
-                            red_counts.append(np.sum(red_pixels))
-
-                        # monta grid dinâmico: 1 linha para GT + N linhas para modelos
-                        cols = 2 + len(models)
-                        fig, axs = plt.subplots(2, len(models) + 1, figsize=(4 * (len(models) + 1), 8))
-
-                        # primeira linha: imagem e GT
-                        axs[0, 0].imshow(img_disp); axs[0, 0].set_title("Image"); axs[0, 0].axis("off")
-                        axs[0, 1].imshow(gt_disp); axs[0, 1].set_title("GT"); axs[0, 1].axis("off")
-
-                        # predições
-                        for j, (name, disp, dice, miou, red) in enumerate(zip(model_names, pred_disps, dice_scores, miou_scores, red_counts)):
-                            axs[1, j].imshow(disp)
-                            axs[1, j].set_title(f"{name}\nDice={dice:.3f} mIoU={miou:.3f}\nRed:{red}")
-                            axs[1, j].axis("off")
-
-                        plt.tight_layout()
-                        plt.show()
-
-                        img_count += 1
-                        if max_images is not None and img_count >= max_images:
-                            return
-
-
-    def compare_models_on_val(self, val_loader, modelB, num_classes=1, device="cuda", max_images=None):
-        modelA = self.model
-        modelB.eval()
-        modelA.to(device)
-        modelB.to(device)
-        img_count = 0
-
-        with torch.no_grad():
-            for imgs, masks in val_loader:
-                imgs = imgs.to(device)
-                masks = masks.to(device)
-
-                # Forward in both models
-                outA = modelA(imgs)
-                outB = modelB(imgs)
-
-                # If they are logits, apply softmax or sigmoid
-                if num_classes == 1:
-                    predA = torch.sigmoid(outA) > 0.5
-                    predB = torch.sigmoid(outB) > 0.5
-                else:
-                    predA = torch.argmax(F.softmax(outA, dim=1), dim=1)
-                    predB = torch.argmax(F.softmax(outB, dim=1), dim=1)
-
-                # Calculate Dice by Image
-                for i in range(imgs.size(0)):
-                    diceA = self._dice_score(predA[i], masks[i], num_classes)
-                    diceB = self._dice_score(predB[i], masks[i], num_classes)
-                    mIoUA = self._miou_score(predA[i], masks[i], num_classes)
-                    mIoUB = self._miou_score(predB[i], masks[i], num_classes)
-
-                    if diceA > diceB:
-                        # Prepare images for viewing
-                        img_disp = self._prepare_image_disp(imgs[i].cpu())
-
-
-                        mask_np = masks[i].cpu().squeeze().numpy()
-                        gt_disp, ignore_mask = self._prepare_mask_vis(mask_np, num_classes)
-
-                        predA_disp = self._prepare_prediction_vis(outA,
-                                                                mask_np,
-                                                                num_classes=num_classes,
-                                                                do_diff=True,
-                                                                ignore_mask=ignore_mask)
-
-                        predB_disp = self._prepare_prediction_vis(outB,
-                                                                mask_np,
-                                                                num_classes=num_classes,
-                                                                do_diff=True,
-                                                                ignore_mask=ignore_mask)
-
-                        red_pixels = np.all(predA_disp == np.array([1.0, 0.0, 0.0], dtype=np.float32), axis=2)
-                        num_red_pixelsA = np.sum(red_pixels)
-                        red_pixels = np.all(predB_disp == np.array([1.0, 0.0, 0.0], dtype=np.float32), axis=2)
-                        num_red_pixelsB = np.sum(red_pixels)
-
-                        # Show in a 2x2 figure
-                        fig, axs = plt.subplots(2, 2, figsize=(8, 8))
-                        axs[0,0].imshow(img_disp); axs[0,0].set_title("Image")
-                        axs[0,1].imshow(gt_disp); axs[0,1].set_title("GT")
-                        axs[1,0].imshow(predA_disp); axs[1,0].set_title(f"Model A Dice={diceA:.3f} mIoU={mIoUA:.3f} \n Red:{num_red_pixelsA}")
-                        axs[1,1].imshow(predB_disp); axs[1,1].set_title(f"Model B Dice={diceB:.3f} mIoU={mIoUB:.3f} \n Red:{num_red_pixelsB}")
-
-
-
-                        for ax in axs.flat: ax.axis("off")
-                        plt.tight_layout()
-                        plt.show()
-
-                        img_count += 1
-                        if max_images is not None and img_count >= max_images:
-                            return
-
-    def _miou_score(self, pred, target, num_classes=1, ignore_val=255, eps=1e-6):
-        pred = pred.view(-1)
-        target = target.view(-1)
-
-        # Ignored mask
-        valid_mask = (target != ignore_val)
-
-        iou_total = 0.0
-        for c in range(num_classes):
-            pred_c = (pred == c) & valid_mask
-            target_c = (target == c) & valid_mask
-
-            inter = (pred_c & target_c).sum().item()
-            union = (pred_c | target_c).sum().item()
-
-            if union == 0:
-                iou = 1.0  # if the class is not present in either the GT or the prediction
-            else:
-                iou = inter / (union + eps)
-
-            iou_total += iou
-
-        return iou_total / num_classes
-
-
-    def _dice_score(self, pred, target, num_classes=1, eps=1e-6):
-        """
-        Calculates Dice Score between prediction and ground truth.
-        """
-        if num_classes == 1:
-            pred = pred.view(-1).float()
-            target = target.view(-1).float()
-            inter = (pred * target).sum()
-            return (2 * inter + eps) / (pred.sum() + target.sum() + eps)
-        else:
-            dice_total = 0
-            for c in range(num_classes):
-                pred_c = (pred == c).float().view(-1)
-                target_c = (target == c).float().view(-1)
-                inter = (pred_c * target_c).sum()
-                dice_total += (2 * inter + eps) / (pred_c.sum() + target_c.sum() + eps)
-            return dice_total / num_classes
+    
 
 
     # Output Functions
@@ -380,8 +162,7 @@ class ImageComparisonGenerator:
         if self.model is None:
             raise Exception("The model is not loaded.")
 
-        device1 = next(self.model.parameters()).device
-        device2 = next(self.model2.parameters()).device if self.model2 is not None else device1
+        device = next(self.model.parameters()).device
 
         self.model.eval()
         if self.model2 is not None:
@@ -392,7 +173,7 @@ class ImageComparisonGenerator:
         with torch.no_grad():
             for idx, sample_idx in enumerate(samples):
                 img, mask = self._get_sample_by_index(sample_loader, sample_idx)
-                img = img.to(device1)
+                img = img.to(device)
                 mask_np = mask.cpu().squeeze().numpy()
 
                 mask_vis, ignore_mask = self._prepare_mask_vis(mask_np, num_classes)
@@ -406,7 +187,7 @@ class ImageComparisonGenerator:
 
                 # Model 2 prediction, if it exists
                 if self.model2 is not None:
-                    img2 = img.to(device2)
+                    img2 = img.to(device)
                     pred2_vis = self._prepare_prediction_vis(
                         self.get_model_output(img2, model=self.model2),
                         mask_np, num_classes, do_diff, invert_diff_colors, ignore_mask
@@ -444,161 +225,6 @@ class ImageComparisonGenerator:
         else:
             plt.show()
 
-    def compare_multiple_models_on_val(
-        self,
-        sample_loader,
-        models,
-        model_names=None,
-        num_classes=1,
-        device="cuda",
-        samples=[0],
-        print_as_grid=False,
-        save_as=None,
-        font_size=18,
-        invert_diff_colors=True,
-    ):
-        """
-        Compara múltiplos modelos no conjunto de validação.
-        Mostra imagem, GT e predições dos modelos cujo desempenho difira.
-
-        Args:
-            sample_loader: dataloader de validação
-            models: lista de modelos [modelA, modelB, modelC, ...]
-            model_names: lista de nomes correspondentes aos modelos
-            num_classes: número de classes (1 = binária)
-            device: cuda ou cpu
-            max_images: máximo de amostras a exibir
-        """
-
-        if not isinstance(models, (list, tuple)):
-            raise ValueError("models deve ser uma lista de modelos [modelA, modelB, ...]")
-        if model_names is None:
-            model_names = [f"Model {i+1}" for i in range(len(models))]
-        if len(model_names) != len(models):
-            raise ValueError("O número de nomes deve corresponder ao número de modelos.")
-
-        # Move todos os modelos para o dispositivo e para modo eval
-        for m in models:
-            m.to(device)
-            m.eval()
-
-        img_count = 0
-
-        with torch.no_grad():
-            for idx, sample_idx in enumerate(samples):
-                imgs, masks = self._get_sample_by_index(sample_loader, sample_idx)
-                imgs  = imgs.to(device)
-                masks = masks.to(device)
-
-                # forward em todos os modelos
-                outputs = [m(imgs) for m in models]
-
-                # converte para predições binárias ou categóricas
-                preds = []
-                for out in outputs:
-                    if num_classes == 1:
-                        preds.append(torch.sigmoid(out) > 0.5)
-                    else:
-                        preds.append(torch.argmax(F.softmax(out, dim=1), dim=1))
-
-                # loop por imagem individual
-                for i in range(imgs.size(0)):
-                    dice_scores = [self._dice_score(pred[i], masks[i], num_classes) for pred in preds]
-                    miou_scores = [self._miou_score(pred[i], masks[i], num_classes) for pred in preds]
-
-
-                    img_disp = self._prepare_image_disp(imgs[i].cpu())
-                    mask_np = masks[i].cpu().squeeze().numpy()
-                    gt_disp, ignore_mask = self._prepare_mask_vis(mask_np, num_classes)
-
-                    # cria predições visuais de todos os modelos
-                    # pred_disps = [
-                    #     self._prepare_prediction_vis(out, mask_np, num_classes=num_classes, do_diff=True, ignore_mask=ignore_mask, invert_diff_colors=invert_diff_colors)
-                    #     for out in outputs
-                    # ]
-
-                    # calcula pixels vermelhos para cada modelo
-                    # red_counts = []
-                    # for disp in pred_disps:
-                    #     red_pixels = np.all(disp == np.array([1.0, 0.0, 0.0], dtype=np.float32), axis=2)
-                    #     red_counts.append(np.sum(red_pixels))
-
-                    if print_as_grid:
-                        rows = len(samples)
-                        cols = 2 + len(models)
-                        fig, axs = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
-
-                        if rows == 1:  # se só há uma linha, axs não é 2D
-                            axs = np.expand_dims(axs, axis=0)
-
-                        for row_idx, sample_idx in enumerate(samples):
-                            # pega imagem e máscara
-                            imgs, masks = self._get_sample_by_index(sample_loader, sample_idx)
-                            imgs = imgs.to(device)
-                            masks = masks.to(device)
-
-                            outputs = [m(imgs) for m in models]
-                            preds = [torch.sigmoid(out) > 0.5 for out in outputs] if num_classes == 1 else [
-                                torch.argmax(F.softmax(out, dim=1), dim=1) for out in outputs
-                            ]
-
-                            for i in range(imgs.size(0)):
-                                img_disp = self._prepare_image_disp(imgs[i].cpu())
-                                mask_np = masks[i].cpu().squeeze().numpy()
-                                gt_disp, ignore_mask = self._prepare_mask_vis(mask_np, num_classes)
-                                pred_disps = [
-                                    self._prepare_prediction_vis(out, mask_np, num_classes=num_classes, do_diff=True, ignore_mask=ignore_mask, invert_diff_colors=invert_diff_colors)
-                                    for out in outputs
-                                ]
-
-                                # ---- Primeira linha recebe os títulos ----
-                                if row_idx == 0:
-                                    axs[row_idx, 0].set_title("Image", fontsize=font_size)
-                                    axs[row_idx, 1].set_title("Ground Truth", fontsize=font_size)
-                                    for j, name in enumerate(model_names):
-                                        axs[row_idx, 2 + j].set_title(name, fontsize=font_size)
-
-                                # ---- Plots ----
-                                axs[row_idx, 0].imshow(img_disp)
-                                axs[row_idx, 1].imshow(gt_disp, cmap='gray', vmin=0, vmax=1)
-                                for j, disp in enumerate(pred_disps):
-                                    axs[row_idx, 2 + j].imshow(disp)
-
-                                # remove eixos
-                                for j in range(cols):
-                                    axs[row_idx, j].axis("off")
-
-                        plt.subplots_adjust(wspace=0.02, hspace=0.02)
-                        if save_as is not None:
-                            plt.savefig(save_as, bbox_inches='tight', pad_inches=0)
-                        plt.show()
-                        return
-                    else:
-                        cols = 2 + len(models)
-                        fig, axs = plt.subplots(1, cols, figsize=(4 * cols, 4))
-
-                        # primeira coluna: imagem
-                        axs[0].imshow(img_disp)
-                        axs[0].set_title("Image", fontsize=font_size)
-                        axs[0].axis("off")
-
-                        # segunda coluna: GT
-                        axs[1].imshow(gt_disp, cmap='gray', vmin=0, vmax=1)
-                        axs[1].set_title("Ground Truth", fontsize=font_size)
-                        axs[1].axis("off")
-
-                        # demais colunas: modelos
-                        for j, (name, disp, dice, miou, red) in enumerate(zip(model_names, pred_disps, dice_scores, miou_scores)):
-                            axs[2 + j].imshow(disp)
-                            #axs[2 + j].set_title(f"{name}\nDice={dice:.3f} mIoU={miou:.3f}\nRed:{red}")
-                            axs[2 + j].set_title(f"{name}", fontsize=font_size)
-                            axs[2 + j].axis("off")
-
-                        plt.subplots_adjust(wspace=0.02, hspace=0.02, left=0.00, right=0.5, top=0.95, bottom=0.05)
-                        if save_as is not None:
-                            plt.savefig(save_as)
-                        plt.show()
-
 
 
 
@@ -606,10 +232,6 @@ class ImageComparisonGenerator:
 
 # In[ ]:
 
-
-class ImageComparisonGenMobileNetV2(ImageComparisonGenerator):
-    def get_model_output(self,images):
-        return self.model(images)['out']
 
 def load_model(model, model_file_name):
     checkpoint = torch.load(model_file_name, map_location='cpu')
@@ -621,55 +243,4 @@ def load_model(model, model_file_name):
 
     model.load_state_dict(filtered_state_dict, strict=False)
     return model
-
-
-# In[ ]:
-
-
-#LaRS boat comparison
-if __name__ == '__main__':
-    path = './LaRS/'
-    in_channels = 3
-    num_classes = 3
-
-    import sys
-    sys.path.append(path)
-
-    import config as lars_config
-    import LaRS_dataset
-
-    train_loader, test_loader, val_loader = LaRS_dataset.get_LaRS_datasets(lars_config.dataset_path, 
-                                                                            resolution=256, 
-                                                                            batch_size=16)
-
-
-
-    # from MobileNetV2 import *
-    # model = getDeepLabV3_MobileNetV2(num_classes, in_channels=in_channels)
-    # model_file_dir = f'{path}MobileNetV2/MobileNetV2-epochs300.pth'
-    # checkpoint = torch.load(model_file_dir, weights_only=False)
-    # model.load_state_dict(checkpoint['model_state_dict'])
-    # icg = ImageComparisonGenMobileNetV2(model)
-    # icg.save_output_quad(val_loader, samples=[0], num_classes=num_classes, do_save='lars-deeplab.eps')
-
-
-    # from unets_classic import *
-    # model = getUnetClassic('P', in_channels=in_channels, out_channels=num_classes)
-    # model_file_dir = f'{path}u-net-CIARP/u-net-classic-aug-P-epochs300.pth'
-    # checkpoint = torch.load(model_file_dir, weights_only=False)
-    # model.load_state_dict(checkpoint['model_state_dict'])
-    # icg = ImageComparisonGenerator(model)
-    # icg.save_output_row(val_loader, samples=[3,9], num_classes=num_classes, do_save='lars-unet.eps')
-
-
-    # from ULite import ULite
-    # model = ULite(in_channels=in_channels, out=num_classes)
-    # model_file_dir = f'{path}U-Lite-VISAPP-2026/ULite-1-epochs300-best.pth'
-    # checkpoint = torch.load(model_file_dir, weights_only=False)
-    # model.load_state_dict(checkpoint['model_state_dict'])
-    # icg = ImageComparisonGenerator(model)
-    # icg.save_output_row(val_loader, samples=[3,9], num_classes=num_classes, do_save='lars-ulite.eps')
-
-
-
 
