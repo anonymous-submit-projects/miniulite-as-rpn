@@ -21,7 +21,7 @@ from util import count_trainable_parameters, measure_inference_speed
 
 #pip install XlsxWriter
 #jupyter nbconvert --to script Trainer.ipynb
-
+#Version 1.0
 
 # In[ ]:
 

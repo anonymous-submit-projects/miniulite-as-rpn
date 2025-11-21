@@ -12,6 +12,7 @@ import os
 
 
 #jupyter nbconvert --to script ImageComparisonGenerator.ipynb
+#Version 1.0
 
 class ImageComparisonGenerator:
 
