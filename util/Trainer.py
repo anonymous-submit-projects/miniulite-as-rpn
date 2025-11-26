@@ -21,7 +21,8 @@ from util import count_trainable_parameters, measure_inference_speed
 
 #pip install XlsxWriter
 #jupyter nbconvert --to script Trainer.ipynb
-#Version 1.0
+#Version 1.1
+
 
 # In[ ]:
 
@@ -441,6 +442,10 @@ class Trainer:
     
     
     def load_xlsx_history(self):
+        # If xlsx didn't exists, just return 0 and 0 and the Trainer will create a new one
+        if os.path.exists(self.hist_name) == False:
+            return 0, 0
+        
         # Read all sheets in the file
         xls = pd.read_excel(self.hist_name, sheet_name=None)
 
