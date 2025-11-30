@@ -1,7 +1,9 @@
-#Version 1.0
+#Version 1.2
+
 import torch
 import time
 import os
+import re
 from matplotlib import pyplot as plt
 import torch.nn as nn
 import numpy as np
@@ -9,8 +11,7 @@ import gc
 import pandas as pd
 from torch.profiler import profile, record_function, ProfilerActivity
 from thop import profile
-import re
-
+from ultralytics import YOLO
 
 def show_dataset_prev(train_loader, test_loader, val_loader=None, num_images=3, num_classes=1):
     images_shown = 0
@@ -114,8 +115,10 @@ def clear_gpu():
     torch.cuda.ipc_collect()
 
 
-def measure_inference_speed(model, test_loader, measure_cpu_speed=True, measure_gpu_speed=True):
+def measure_inference_speed(model, test_loader, measure_cpu_speed=True, measure_gpu_speed=True, steps=100):
     model.eval()
+
+    is_yolo = isinstance(model, YOLO)
 
     # Get only the first batch from test_loader
     inputs, _ = next(iter(test_loader))
@@ -134,23 +137,30 @@ def measure_inference_speed(model, test_loader, measure_cpu_speed=True, measure_
             results['gpu'] = (None, None)
             continue
 
-        model.to(device)
+
+        if is_yolo == False:
+            model.to(device)
         inputs_device = inputs.to(device)
 
         # Heating
         with torch.no_grad():
             for _ in range(5):
-                _ = model(inputs_device)
+                if is_yolo:
+                    _ = model(inputs_device, verbose=False, stream=False)
+                else:
+                    _ = model(inputs_device)
 
         if device == 'cuda':
             torch.cuda.synchronize()
         start_time = time.time()
 
         # Measures pure routing time (100 executions of the same batch)
-        steps = 1
         with torch.no_grad():
             for _ in range(steps):
-                _ = model(inputs_device)
+                if is_yolo:
+                    _ = model(inputs_device, verbose=False, stream=False)
+                else:
+                    _ = model(inputs_device)
 
         if device == 'cuda':
             torch.cuda.synchronize()
@@ -172,6 +182,44 @@ def measure_inference_speed(model, test_loader, measure_cpu_speed=True, measure_
         return fps_cpu, time_per_image_cpu
     elif measure_gpu_speed:
         return fps_gpu, time_per_image_gpu
+
+
+
+
+def measure_glops_fps(model, val_loader, model_filename=None, resolution=224):
+    model.eval()
+    torch.set_grad_enabled(False)
+
+    if model_filename is not None:
+        state_dict = torch.load(model_filename, map_location='cpu')
+        model.load_state_dict(state_dict['model_state_dict'], strict=False)
+
+    # Measure FLOPs
+    if isinstance(model, YOLO):
+        # It's yolo
+        model.info(verbose=True)
+        params_m = 0
+        gflops = 0
+    else:
+        device = next(model.parameters()).device
+        inp = torch.randn(1, 3, resolution, resolution).to(device)
+        macs, params = profile(model, inputs=(inp,))
+
+        # Convert MACs (Multiply-Accumulate operations) to GFLOPs. 
+        # We multiply by 2 because 1 MAC = 2 FLOPs.
+        gflops = macs / 1e9
+        params_m = params
+
+    # Measure FPS
+    gpu_fps, gpu_time_per_image, cpu_fps, cpu_time_per_image = measure_inference_speed(model, val_loader, steps=100)
+
+    return {
+        'params': params_m,
+        'gflops': gflops,
+        'gpu_fps': gpu_fps,
+        'cpu_fps': cpu_fps
+    }
+
 
 
 def compile_xls_best_results(input_dir, output_file="result.xlsx"):
